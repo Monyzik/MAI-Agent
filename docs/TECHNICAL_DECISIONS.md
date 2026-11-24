@@ -75,3 +75,7 @@
   миграция `0014_drop_external_data` (служебная БД — только служебные
   таблицы), `docker-compose.yml` (служебная БД `mai_backend`),
   `backend/hermes-profile/SOUL.md` (раздел «Архитектура данных»).
+- **Проверка запуска (2026-11-24).** При переключении БД передаём объект
+  `sqlalchemy.engine.URL` в `create_engine`, чтобы сохранить пароль.
+  Docker Compose поднял все три сервиса, Alembic применил ревизию
+  `0014_drop_external_data`, подключения к трём БД и `/ready` проверены.

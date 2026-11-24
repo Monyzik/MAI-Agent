@@ -17,7 +17,8 @@ only the table layouts are ensured.
 import json
 from pathlib import Path
 
-from sqlalchemy import inspect, text
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 
 from app.config import get_settings
 from app.db import Base, fis_engine, own_engine
@@ -74,15 +75,12 @@ CREATE TABLE IF NOT EXISTS ratings (
 
 def _ensure_server_databases() -> None:
     """Create the own/ФИС databases on the Postgres server (no-op if present)."""
-    from sqlalchemy.engine import make_url
-
     settings = get_settings()
     url = make_url(settings.database_url)
     if url.get_backend_name() != "postgresql":
         return
-    from sqlalchemy import create_engine
 
-    server_url = str(make_url(str(url)).set(database="postgres"))
+    server_url = url.set(database="postgres")
     # CREATE DATABASE cannot run inside a transaction block, so this
     # connection is autocommit: each statement commits on its own.
     server_engine = create_engine(server_url, isolation_level="AUTOCOMMIT")

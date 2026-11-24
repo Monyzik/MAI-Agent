@@ -18,7 +18,7 @@ three point at the same file.
 from collections.abc import Generator
 
 from sqlalchemy import create_engine
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import get_settings
@@ -35,14 +35,14 @@ if database_url.startswith("sqlite"):
     engine_options["connect_args"] = {"check_same_thread": False}
 
 
-def _url_for_db_name(url: str, db_name: str) -> str:
+def _url_for_db_name(url: str, db_name: str) -> str | URL:
     """Return ``url`` with the database name swapped for ``db_name``."""
     if url.startswith("sqlite"):
         return url
-    return str(make_url(url).set(database=db_name))
+    return make_url(url).set(database=db_name)
 
 
-def _make_engine(url: str):
+def _make_engine(url: str | URL):
     options = dict(engine_options)
     return create_engine(url, **options)
 

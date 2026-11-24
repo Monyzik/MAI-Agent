@@ -1,8 +1,6 @@
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
 .Python
 .pytest_cache/
 .ruff_cache/
@@ -36,14 +34,14 @@ pnpm-debug.log*
 .yarn/
 .pnpm-store/
 *.tsbuildinfo
-dist/
 
 # Frontend tooling
 .vite/
 .next/
 .cache/
 
-# VS Code
+# Editors
+.idea/
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
@@ -62,8 +60,9 @@ docker-compose.override.yml
 .docker/
 # Local dev override (remaps container postgres to host :5433; host dev DB uses :5432)
 compose.local.yml
+
 # E2E run artifacts
-scripts/e2e_compose_result.json
+/scripts/e2e_*_result.json
 
 # Local environment and secrets
 .env
@@ -78,6 +77,8 @@ certs/*
 *.sqlite
 *.sqlite3
 *.dump
+backup_mai_*.sql
+mai_agent_pre_sessionless_*.sql
 *.log
 logs/
 data/
