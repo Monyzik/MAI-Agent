@@ -19,7 +19,9 @@ None of the tools is bound to a user profile: there are no user accounts in
 the system, and the trusted-context header is not sent to the MCP server.
 """
 
+import logging
 from datetime import date
+from time import monotonic
 
 from fastapi.encoders import jsonable_encoder
 from fastmcp import FastMCP
@@ -27,7 +29,9 @@ from sqlalchemy import func, select, text
 
 from app.db import FisSessionLocal, OwnSessionLocal
 from app.models import SyntheticEgeCandidate, SyntheticEgeResult
+from app.safe_logging import log_event
 
+logger = logging.getLogger(__name__)
 mcp = FastMCP("MAI-Agent tools")
 
 
@@ -113,10 +117,46 @@ def search_synthetic_ege_results(full_name: str, date_of_birth: date) -> dict[st
       the same full name and date of birth. Do not offer a choice between
       records automatically.
     """
-    with FisSessionLocal() as db:
-        return jsonable_encoder(search_synthetic_candidates(db, full_name, date_of_birth))
-
-
+    started_at = monotonic()
+    try:
+        with FisSessionLocal() as db:
+            payload = jsonable_encoder(search_synthetic_candidates(db, full_name, date_of_birth))
+    except ValueError:
+        log_event(
+            logger,
+            logging.INFO,
+            "mcp_tool_call",
+            channel="mcp",
+            outcome="rejected",
+            reason_code="invalid_arguments",
+            tool_name="search_synthetic_ege_results",
+            duration_ms=int((monotonic() - started_at) * 1000),
+        )
+        raise
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.ERROR,
+            "mcp_tool_call",
+            channel="mcp",
+            outcome="error",
+            reason_code=type(exc).__name__,
+            tool_name="search_synthetic_ege_results",
+            duration_ms=int((monotonic() - started_at) * 1000),
+        )
+        raise
+    log_event(
+        logger,
+        logging.INFO,
+        "mcp_tool_call",
+        channel="mcp",
+        outcome="success",
+        tool_name="search_synthetic_ege_results",
+        match_count=payload["match_count"],
+        ambiguous=payload["ambiguous"],
+        duration_ms=int((monotonic() - started_at) * 1000),
+    )
+    return payload
 @mcp.tool
 def list_synthetic_ege_candidates(limit: int = 100, offset: int = 0) -> dict[str, object]:
     """List people from the synthetic ФИС ГИА registry (ordered by candidate_id).
@@ -129,30 +169,58 @@ def list_synthetic_ege_candidates(limit: int = 100, offset: int = 0) -> dict[str
         limit: maximum number of candidates per page (default 100, max 500).
         offset: zero-based offset of the first candidate of the page.
     """
+    started_at = monotonic()
     rows_limit = max(1, min(int(limit or 100), 500))
-    with FisSessionLocal() as db:
-        total_count = db.scalar(select(func.count(SyntheticEgeCandidate.candidate_id)))
-        rows = db.scalars(
-            select(SyntheticEgeCandidate)
-            .order_by(SyntheticEgeCandidate.candidate_id)
-            .limit(rows_limit)
-            .offset(max(0, int(offset or 0)))
+    safe_offset = max(0, int(offset or 0))
+    try:
+        with FisSessionLocal() as db:
+            total_count = db.scalar(select(func.count(SyntheticEgeCandidate.candidate_id)))
+            rows = db.scalars(
+                select(SyntheticEgeCandidate)
+                .order_by(SyntheticEgeCandidate.candidate_id)
+                .limit(rows_limit)
+                .offset(safe_offset)
+            )
+            payload = jsonable_encoder(
+                {
+                    "total": int(total_count or 0),
+                    "limit": rows_limit,
+                    "offset": safe_offset,
+                    "candidates": [
+                        {
+                            "candidate_id": c.candidate_id,
+                            "full_name": c.full_name,
+                            "date_of_birth": c.date_of_birth,
+                        }
+                        for c in rows
+                    ],
+                }
+            )
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.ERROR,
+            "mcp_tool_call",
+            channel="mcp",
+            outcome="error",
+            reason_code=type(exc).__name__,
+            tool_name="list_synthetic_ege_candidates",
+            duration_ms=int((monotonic() - started_at) * 1000),
         )
-        return jsonable_encoder(
-            {
-                "total": int(total_count or 0),
-                "limit": rows_limit,
-                "offset": max(0, int(offset or 0)),
-                "candidates": [
-                    {
-                        "candidate_id": c.candidate_id,
-                        "full_name": c.full_name,
-                        "date_of_birth": c.date_of_birth,
-                    }
-                    for c in rows
-                ],
-            }
-        )
+        raise
+    log_event(
+        logger,
+        logging.INFO,
+        "mcp_tool_call",
+        channel="mcp",
+        outcome="success",
+        tool_name="list_synthetic_ege_candidates",
+        row_count=len(payload["candidates"]),
+        limit=rows_limit,
+        offset=safe_offset,
+        duration_ms=int((monotonic() - started_at) * 1000),
+    )
+    return payload
 
 
 @mcp.tool
@@ -165,34 +233,79 @@ def get_synthetic_ege_results(candidate_id: str) -> dict[str, object]:
     Args:
         candidate_id: the registry id of the person.
     """
-    candidate_id = (candidate_id or "").strip()
-    if not candidate_id:
+    started_at = monotonic()
+    cleaned_id = (candidate_id or "").strip()
+    if not cleaned_id:
+        log_event(
+            logger,
+            logging.INFO,
+            "mcp_tool_call",
+            channel="mcp",
+            outcome="rejected",
+            reason_code="missing_candidate_id",
+            tool_name="get_synthetic_ege_results",
+            duration_ms=int((monotonic() - started_at) * 1000),
+        )
         raise ValueError("candidate_id is required")
-    with FisSessionLocal() as db:
-        candidate = db.get(SyntheticEgeCandidate, candidate_id)
-        if candidate is None:
-            raise ValueError(f"Candidate {candidate_id} not found in the synthetic registry")
-        results = db.scalars(
-            select(SyntheticEgeResult)
-            .where(
-                SyntheticEgeResult.candidate_id == candidate_id,
-                SyntheticEgeResult.status == "valid",
+    try:
+        with FisSessionLocal() as db:
+            candidate = db.get(SyntheticEgeCandidate, cleaned_id)
+            if candidate is None:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "mcp_tool_call",
+                    channel="mcp",
+                    outcome="rejected",
+                    reason_code="candidate_not_found",
+                    tool_name="get_synthetic_ege_results",
+                    duration_ms=int((monotonic() - started_at) * 1000),
+                )
+                raise ValueError(f"Candidate {cleaned_id} not found in the synthetic registry")
+            results = db.scalars(
+                select(SyntheticEgeResult)
+                .where(
+                    SyntheticEgeResult.candidate_id == cleaned_id,
+                    SyntheticEgeResult.status == "valid",
+                )
+                .order_by(SyntheticEgeResult.subject, SyntheticEgeResult.year.desc())
             )
-            .order_by(SyntheticEgeResult.subject, SyntheticEgeResult.year.desc())
+            payload = jsonable_encoder(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "full_name": candidate.full_name,
+                    "date_of_birth": candidate.date_of_birth,
+                    "results": [
+                        {"subject": r.subject, "year": r.year, "score": r.score}
+                        for r in results
+                    ],
+                }
+            )
+    except ValueError:
+        raise
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.ERROR,
+            "mcp_tool_call",
+            channel="mcp",
+            outcome="error",
+            reason_code=type(exc).__name__,
+            tool_name="get_synthetic_ege_results",
+            duration_ms=int((monotonic() - started_at) * 1000),
         )
-        return jsonable_encoder(
-            {
-                "candidate_id": candidate.candidate_id,
-                "full_name": candidate.full_name,
-                "date_of_birth": candidate.date_of_birth,
-                "results": [
-                    {"subject": r.subject, "year": r.year, "score": r.score}
-                    for r in results
-                ],
-            }
-        )
-
-
+        raise
+    log_event(
+        logger,
+        logging.INFO,
+        "mcp_tool_call",
+        channel="mcp",
+        outcome="success",
+        tool_name="get_synthetic_ege_results",
+        row_count=len(payload["results"]),
+        duration_ms=int((monotonic() - started_at) * 1000),
+    )
+    return payload
 # ─────────────────────────────────────────────────────────────────────────────
 # SQL tool: the agent's own database (mai_agent) — second external data source
 # ─────────────────────────────────────────────────────────────────────────────
@@ -285,6 +398,46 @@ def sql_query(sql: str, limit: int = 100) -> dict[str, object]:
         sql: the SQL statement to execute.
         limit: maximum number of rows to display for SELECT (default 100, max 500).
     """
-    statement = _validate_sql(sql)
-    with OwnSessionLocal() as db:
-        return run_sql(db, statement, limit)
+    started_at = monotonic()
+    try:
+        statement = _validate_sql(sql)
+    except ValueError as exc:
+        reason = "empty_sql" if "Empty" in str(exc) else "multiple_statements"
+        log_event(
+            logger,
+            logging.INFO,
+            "mcp_tool_call",
+            channel="mcp",
+            outcome="rejected",
+            reason_code=reason,
+            tool_name="sql_query",
+            duration_ms=int((monotonic() - started_at) * 1000),
+        )
+        raise
+    try:
+        with OwnSessionLocal() as db:
+            payload = run_sql(db, statement, limit)
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.ERROR,
+            "mcp_tool_call",
+            channel="mcp",
+            outcome="error",
+            reason_code=type(exc).__name__,
+            tool_name="sql_query",
+            duration_ms=int((monotonic() - started_at) * 1000),
+        )
+        raise
+    log_event(
+        logger,
+        logging.INFO,
+        "mcp_tool_call",
+        channel="mcp",
+        outcome="success",
+        tool_name="sql_query",
+        row_count=payload.get("row_count"),
+        affected_rows=payload.get("affected_rows"),
+        duration_ms=int((monotonic() - started_at) * 1000),
+    )
+    return payload

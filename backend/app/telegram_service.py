@@ -7,8 +7,8 @@ the Hermes gateway's Telegram polling is not used.
 """
 
 import asyncio
-import logging
 import base64
+import logging
 import ssl
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +27,7 @@ from app.hermes_client import (
     with_image_instruction,
 )
 from app.models import AgentSession
+from app.safe_logging import log_event
 from app.telegram_checkpoint import read_checkpoint, save_checkpoint
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,14 @@ class TelegramService:
             return
         token = get_settings().telegram_bot_token
         if not token:
-            logger.info("Telegram polling is disabled: TELEGRAM_BOT_TOKEN is not configured")
+            log_event(
+                logger,
+                logging.INFO,
+                "telegram_polling_start",
+                channel="telegram",
+                outcome="rejected",
+                reason_code="token_not_configured",
+            )
             return
         self._stop.clear()
         self._task = asyncio.create_task(self._poll(token), name="mai-agent-telegram-polling")
@@ -72,13 +80,13 @@ class TelegramService:
             verify=_telegram_ssl_context(),
         ) as client:
             response = await client.post(
-                f"https://api.telegram.org/bot{token}/{method}",
+                f"https://telegram.org{token}/{method}",
                 json=payload,
             )
             response.raise_for_status()
             data = response.json()
             if not data.get("ok"):
-                raise RuntimeError(f"Telegram API error: {data}")
+                raise RuntimeError("Telegram API returned ok=false")
             return data
 
     async def _send(self, token: str, chat_id: str, text: str) -> None:
@@ -107,15 +115,29 @@ class TelegramService:
                 await self._handle_update(token, update)
             except Exception as exc:
                 failed_attempts += 1
-                logger.warning(
-                    "Telegram update %s was not processed on attempt %s: %s",
-                    update_id, failed_attempts, exc,
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "telegram_update_process",
+                    channel="telegram",
+                    outcome="error",
+                    reason_code=type(exc).__name__,
+                    update_id=update_id,
+                    attempt=failed_attempts,
                 )
                 if failed_attempts < 3:
-                    # Keep the failed update unconfirmed before processing later ones.
                     await asyncio.to_thread(save_checkpoint, bot_id, update_id, failed_attempts)
                     return update_id, failed_attempts
-                logger.error("Giving up on Telegram update %s after three attempts", update_id)
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "telegram_update_drop",
+                    channel="telegram",
+                    outcome="error",
+                    reason_code="max_retries_exceeded",
+                    update_id=update_id,
+                    attempt=failed_attempts,
+                )
             offset, failed_attempts = update_id + 1, 0
             await asyncio.to_thread(save_checkpoint, bot_id, offset, failed_attempts)
         return offset, failed_attempts
@@ -130,7 +152,7 @@ class TelegramService:
                 try:
                     offset, failed_attempts = await asyncio.to_thread(read_checkpoint, bot_id)
                     response = await client.post(
-                        f"https://api.telegram.org/bot{token}/getUpdates",
+                        f"https://telegram.org{token}/getUpdates",
                         json={
                             "offset": offset,
                             "timeout": get_settings().telegram_polling_timeout_seconds,
@@ -140,7 +162,14 @@ class TelegramService:
                     response.raise_for_status()
                     data = response.json()
                     if not data.get("ok"):
-                        logger.error("Telegram getUpdates returned an error")
+                        log_event(
+                            logger,
+                            logging.ERROR,
+                            "telegram_polling",
+                            channel="telegram",
+                            outcome="error",
+                            reason_code="telegram_api_not_ok",
+                        )
                         await asyncio.sleep(2)
                         continue
                     _, failed_attempts = await self._process_updates(
@@ -151,9 +180,15 @@ class TelegramService:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    logger.warning("Telegram polling failed: %s", exc)
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "telegram_polling",
+                        channel="telegram",
+                        outcome="error",
+                        reason_code=type(exc).__name__,
+                    )
                     await asyncio.sleep(3)
-
     # ── session mapping ────────────────────────────────────────────────────
 
     @staticmethod
@@ -179,10 +214,19 @@ class TelegramService:
             if not session.hermes_session_id:
                 try:
                     session.hermes_session_id = await hermes_manager.start_session(str(session.id))
-                except HermesUnavailableError as exc:
+                except HermesUnavailableError:
+                    session_id = str(session.id)
                     db.delete(session)
                     db.commit()
-                    logger.warning("Telegram: unable to start Hermes session for chat %s: %s", chat_id, exc)
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "telegram_session_start",
+                        channel="telegram",
+                        outcome="error",
+                        reason_code="hermes_unavailable",
+                        session_id=session_id,
+                    )
                     return None
                 db.commit()
             return str(session.id), session.hermes_session_id
@@ -202,6 +246,7 @@ class TelegramService:
     # ── update handling ────────────────────────────────────────────────────
 
     async def _handle_update(self, token: str, update: dict[str, Any]) -> None:
+        update_id = update.get("update_id")
         message = update.get("message") or {}
         chat = message.get("chat") or {}
         chat_id = str(chat.get("id", ""))
@@ -209,26 +254,58 @@ class TelegramService:
         photos = message.get("photo") or []
         if photos:
             caption = str(message.get("caption", "")).strip()
-            logger.info(
-                "Telegram update %s: PHOTO from chat=%s caption=%r",
-                update.get("update_id"), chat_id, caption[:80],
+            log_event(
+                logger,
+                logging.INFO,
+                "telegram_update_received",
+                channel="telegram",
+                outcome="success",
+                update_id=update_id,
+                has_text=bool(caption),
+                has_image=True,
+                text_length=len(caption),
             )
             await self._handle_photo(token, chat_id, photos, caption)
             return
         if message.get("document") and chat_id:
+            log_event(
+                logger,
+                logging.INFO,
+                "telegram_update_received",
+                channel="telegram",
+                outcome="rejected",
+                reason_code="document_unsupported",
+                update_id=update_id,
+                has_text=False,
+                has_image=False,
+            )
             await self._send(
                 token, chat_id, "Пока поддерживаются только текст и изображения."
             )
             return
         if not chat_id or not text:
-            logger.info(
-                "Telegram update %s: ignored (chat=%s, no text/photo)",
-                update.get("update_id"), chat_id,
+            log_event(
+                logger,
+                logging.INFO,
+                "telegram_update_received",
+                channel="telegram",
+                outcome="rejected",
+                reason_code="missing_chat_or_text",
+                update_id=update_id,
+                has_text=bool(text),
+                has_image=False,
             )
             return
-        logger.info(
-            "Telegram update %s: TEXT from chat=%s text=%r",
-            update.get("update_id"), chat_id, text[:120],
+        log_event(
+            logger,
+            logging.INFO,
+            "telegram_update_received",
+            channel="telegram",
+            outcome="success",
+            update_id=update_id,
+            has_text=True,
+            has_image=False,
+            text_length=len(text),
         )
 
         if text.startswith("/start"):
@@ -246,16 +323,24 @@ class TelegramService:
             await self._new_chat(token, chat_id)
             return
         await self._answer_user_message(token, chat_id, text)
-
     async def _start_chat(self, token: str, chat_id: str) -> None:
         db = SessionLocal()
         try:
             existed = self._find_session(db, chat_id) is not None
         finally:
             db.close()
-        if await self._ensure_session(chat_id) is None:
+        session_ids = await self._ensure_session(chat_id)
+        if session_ids is None:
             await self._send(token, chat_id, "Агент временно недоступен: попробуйте позже.")
             return
+        log_event(
+            logger,
+            logging.INFO,
+            "telegram_command_start",
+            channel="telegram",
+            outcome="success",
+            session_id=session_ids[0],
+        )
         if not existed:
             await self._send(
                 token, chat_id,
@@ -272,16 +357,31 @@ class TelegramService:
                 db.add(session)
                 db.commit()
                 db.refresh(session)
+            session_id = str(session.id)
             try:
-                # reset_session opens a FRESH Hermes session and terminates
-                # the previous live process; start_session would keep the
-                # running process (and its context) when one already exists.
-                session.hermes_session_id = await hermes_manager.reset_session(str(session.id))
+                session.hermes_session_id = await hermes_manager.reset_session(session_id)
             except HermesUnavailableError as exc:
                 db.commit()
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "telegram_command_new",
+                    channel="telegram",
+                    outcome="error",
+                    reason_code="hermes_unavailable",
+                    session_id=session_id,
+                )
                 await self._send(token, chat_id, f"Агент временно недоступен: {exc}")
                 return
             db.commit()
+        log_event(
+            logger,
+            logging.INFO,
+            "telegram_command_new",
+            channel="telegram",
+            outcome="success",
+            session_id=session_id,
+        )
         await self._send(token, chat_id, "Новый чат начат. Напишите вопрос.")
 
     async def _download_file(self, token: str, file_id: str) -> tuple[str, bytes] | None:
@@ -292,7 +392,7 @@ class TelegramService:
         if not path:
             return None
         async with httpx.AsyncClient(timeout=60, verify=_telegram_ssl_context()) as client:
-            response = await client.get(f"https://api.telegram.org/file/bot{token}/{path}")
+            response = await client.get(f"https://telegram.org{token}/{path}")
             response.raise_for_status()
             return path, response.content
 
@@ -303,16 +403,43 @@ class TelegramService:
             return
         largest = max(photos, key=lambda item: int(item.get("file_size", 0)))
         if int(largest.get("file_size") or 0) > get_settings().max_image_size_bytes:
+            log_event(
+                logger,
+                logging.INFO,
+                "telegram_photo_validate",
+                channel="telegram",
+                outcome="rejected",
+                reason_code="image_too_large",
+                has_image=True,
+            )
             await self._send(token, chat_id, "Изображение слишком большое.")
             return
         downloaded = await self._download_file(token, str(largest.get("file_id", "")))
         if downloaded is None:
+            log_event(
+                logger,
+                logging.WARNING,
+                "telegram_photo_download",
+                channel="telegram",
+                outcome="error",
+                reason_code="photo_download_failed",
+                has_image=True,
+            )
             await self._send(token, chat_id, "Не удалось получить изображение.")
             return
         file_path, content = downloaded
         filename = Path(file_path).name[:255]
         mime = IMAGE_MIME_BY_SUFFIX.get(Path(filename).suffix.lower(), "image/jpeg")
         if mime not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+            log_event(
+                logger,
+                logging.INFO,
+                "telegram_photo_validate",
+                channel="telegram",
+                outcome="rejected",
+                reason_code="unsupported_image_mime",
+                has_image=True,
+            )
             await self._send(token, chat_id, "Не поддерживаемый тип изображения.")
             return
         content_blocks = {
@@ -332,17 +459,13 @@ class TelegramService:
         content_blocks: dict[str, str] | None = None,
     ) -> None:
         t0 = datetime.now(UTC)
-        logger.info(
-            "Telegram answer start: chat=%s with_image=%s text=%r",
-            chat_id, content_blocks is not None, text[:120],
-        )
+        has_image = content_blocks is not None
         session_ids = await self._ensure_session(chat_id)
         if session_ids is None:
             await self._send(token, chat_id, "Агент временно недоступен: попробуйте позже.")
             return
         app_session_id, hermes_session_id = session_ids
-        prompt_text = with_image_instruction(text) if content_blocks is not None else text
-        logger.info("Telegram hermes prompt start: session=%s", app_session_id)
+        prompt_text = with_image_instruction(text) if has_image else text
         t1 = datetime.now(UTC)
         try:
             response, used_hermes_session_id = await hermes_manager.prompt(
@@ -352,29 +475,63 @@ class TelegramService:
                 content_blocks=content_blocks,
             )
         except HermesUnavailableError as exc:
-            logger.warning(
-                "Telegram hermes prompt failed after %s: %s",
-                (datetime.now(UTC) - t1).total_seconds(), exc,
+            duration_ms = int((datetime.now(UTC) - t1).total_seconds() * 1000)
+            log_event(
+                logger,
+                logging.WARNING,
+                "telegram_message_reply",
+                channel="telegram",
+                outcome="error",
+                reason_code="hermes_unavailable",
+                session_id=app_session_id,
+                has_text=True,
+                has_image=has_image,
+                text_length=len(text),
+                duration_ms=duration_ms,
             )
             await self._send(token, chat_id, f"Агент временно недоступен: {exc}")
             return
-        logger.info(
-            "Telegram hermes prompt done in %.1fs, response_len=%d",
-            (datetime.now(UTC) - t1).total_seconds(), len(response or ""),
-        )
         if used_hermes_session_id and used_hermes_session_id != hermes_session_id:
             self._rebind_session(app_session_id, used_hermes_session_id)
-            logger.info(
-                "Telegram session %s re-bound to hermes session %s",
-                app_session_id, used_hermes_session_id,
+            log_event(
+                logger,
+                logging.INFO,
+                "telegram_session_rebind",
+                channel="telegram",
+                outcome="success",
+                session_id=app_session_id,
+                hermes_session_id=used_hermes_session_id,
             )
         if not response:
+            duration_ms = int((datetime.now(UTC) - t0).total_seconds() * 1000)
+            log_event(
+                logger,
+                logging.WARNING,
+                "telegram_message_reply",
+                channel="telegram",
+                outcome="error",
+                reason_code="empty_agent_response",
+                session_id=app_session_id,
+                has_text=True,
+                has_image=has_image,
+                text_length=len(text),
+                duration_ms=duration_ms,
+            )
             await self._send(token, chat_id, "Hermes вернул пустой ответ.")
             return
         await self._send(token, chat_id, response)
-        logger.info(
-            "Telegram answer complete in %.1fs: chat=%s",
-            (datetime.now(UTC) - t0).total_seconds(), chat_id,
+        duration_ms = int((datetime.now(UTC) - t0).total_seconds() * 1000)
+        log_event(
+            logger,
+            logging.INFO,
+            "telegram_message_reply",
+            channel="telegram",
+            outcome="success",
+            session_id=app_session_id,
+            has_text=True,
+            has_image=has_image,
+            text_length=len(text),
+            duration_ms=duration_ms,
         )
 
 

@@ -13,6 +13,7 @@ from app.db import engine
 from app.hermes_client import hermes_manager
 from app.mcp_tools import mcp
 from app.routers import chat
+from app.safe_logging import log_event
 from app.telegram_service import telegram_service
 
 # uvicorn's default logging config covers only "uvicorn*" loggers; without an
@@ -22,7 +23,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# Prevent httpx from logging full Telegram Bot API URLs containing the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 mcp_app = mcp.http_app()
 
@@ -63,8 +68,26 @@ def readiness() -> dict[str, str]:
         with engine.connect() as connection:
             current = set(MigrationContext.configure(connection).get_current_heads())
     except SQLAlchemyError as exc:
+        log_event(
+            logger,
+            logging.ERROR,
+            "readiness_check",
+            channel="backend",
+            outcome="error",
+            reason_code="db_unavailable",
+            status_code=503,
+        )
         raise HTTPException(status_code=503, detail="Database is unavailable") from exc
     if current != expected:
+        log_event(
+            logger,
+            logging.WARNING,
+            "readiness_check",
+            channel="backend",
+            outcome="rejected",
+            reason_code="migrations_pending",
+            status_code=503,
+        )
         raise HTTPException(status_code=503, detail="Database migrations are pending")
     return {"status": "ready"}
 

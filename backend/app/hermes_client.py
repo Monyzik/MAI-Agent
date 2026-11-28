@@ -33,6 +33,7 @@ from acp.schema import (
 )
 
 from app.config import get_settings
+from app.safe_logging import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -150,19 +151,55 @@ class HermesClientManager:
                 with suppress(ProcessLookupError):
                     process.kill()
                 await process.wait()
-
     async def _start(self, session_id: str, hermes_session_id: str | None) -> HermesProcess:
+        started_at = monotonic()
         settings = get_settings()
         if settings.acp_transport != "stdio":
+            log_event(
+                logger,
+                logging.ERROR,
+                "acp_process_start",
+                channel="acp",
+                outcome="rejected",
+                reason_code="unsupported_transport",
+                session_id=session_id,
+            )
             raise HermesUnavailableError("Only ACP stdio transport is supported")
         try:
             command = shlex.split(settings.hermes_command)
         except ValueError as exc:
+            log_event(
+                logger,
+                logging.ERROR,
+                "acp_process_start",
+                channel="acp",
+                outcome="rejected",
+                reason_code="invalid_command",
+                session_id=session_id,
+            )
             raise HermesUnavailableError("Invalid HERMES_COMMAND") from exc
         if not command:
+            log_event(
+                logger,
+                logging.ERROR,
+                "acp_process_start",
+                channel="acp",
+                outcome="rejected",
+                reason_code="empty_command",
+                session_id=session_id,
+            )
             raise HermesUnavailableError("HERMES_COMMAND is empty")
         cwd = Path(settings.hermes_cwd).resolve()
         if not cwd.is_dir():
+            log_event(
+                logger,
+                logging.ERROR,
+                "acp_process_start",
+                channel="acp",
+                outcome="rejected",
+                reason_code="missing_cwd",
+                session_id=session_id,
+            )
             raise HermesUnavailableError(f"Hermes working directory does not exist: {cwd}")
 
         try:
@@ -172,11 +209,19 @@ class HermesClientManager:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
-                # ACP JSON lines can include long tool results and image data.
                 limit=50 * 1024 * 1024,
                 env=os.environ.copy(),
             )
         except OSError as exc:
+            log_event(
+                logger,
+                logging.ERROR,
+                "acp_process_start",
+                channel="acp",
+                outcome="error",
+                reason_code="spawn_os_error",
+                session_id=session_id,
+            )
             raise HermesUnavailableError("Unable to start Hermes ACP") from exc
 
         connection = None
@@ -196,8 +241,6 @@ class HermesClientManager:
                 ),
                 timeout=timeout,
             )
-            # The MCP server is exposed without any user context header:
-            # MCP/SQL data sources are not bound to profiles.
             mcp_server = HttpMcpServer(
                 name="mai-agent",
                 url=settings.mcp_public_url,
@@ -226,23 +269,65 @@ class HermesClientManager:
                     finally:
                         callbacks.replaying = False
                 except RequestError as exc:
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "acp_session_load",
+                        channel="acp",
+                        outcome="rejected",
+                        reason_code="session_load_rejected",
+                        session_id=session_id,
+                        hermes_session_id=hermes_session_id,
+                    )
                     raise HermesSessionLoadError("Hermes rejected the stored session") from exc
-                # Hermes returns null for a missing session. ACP SDK 0.9
-                # converts it into an empty LoadSessionResponse.
                 if loaded is None or not loaded.model_fields_set:
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "acp_session_load",
+                        channel="acp",
+                        outcome="rejected",
+                        reason_code="session_not_found",
+                        session_id=session_id,
+                        hermes_session_id=hermes_session_id,
+                    )
                     raise HermesSessionLoadError("Hermes no longer has the stored session")
                 history = list(callbacks.replay)
+            log_event(
+                logger,
+                logging.INFO,
+                "acp_process_start",
+                channel="acp",
+                outcome="success",
+                session_id=session_id,
+                hermes_session_id=hermes_session_id,
+                duration_ms=int((monotonic() - started_at) * 1000),
+            )
             return HermesProcess(
                 process, connection, callbacks, hermes_session_id, history=history
             )
+        except HermesSessionLoadError:
+            await self._stop_process(process, connection)
+            raise
         except (HermesUnavailableError, asyncio.CancelledError):
             await self._stop_process(process, connection)
             raise
         except Exception as exc:
             await self._stop_process(process, connection)
+            reason_code = "startup_timeout" if isinstance(exc, TimeoutError) else "startup_failed"
             detail = (
                 "Hermes ACP startup timed out"
                 if isinstance(exc, TimeoutError) else "Hermes ACP startup failed"
+            )
+            log_event(
+                logger,
+                logging.ERROR,
+                "acp_process_start",
+                channel="acp",
+                outcome="error",
+                reason_code=reason_code,
+                session_id=session_id,
+                duration_ms=int((monotonic() - started_at) * 1000),
             )
             raise HermesUnavailableError(detail) from exc
 
@@ -253,22 +338,35 @@ class HermesClientManager:
         await self._close_unlocked(session_id)
         await self.close_idle()
         if len(self._processes) + self._starting >= get_settings().hermes_max_processes:
+            log_event(
+                logger,
+                logging.WARNING,
+                "acp_session_open",
+                channel="acp",
+                outcome="rejected",
+                reason_code="max_processes_reached",
+                session_id=session_id,
+            )
             raise HermesUnavailableError("Hermes is busy. Please retry.")
         self._starting += 1
         try:
             try:
                 entry = await self._start(session_id, previous_id)
             except HermesSessionLoadError:
-                # Hermes lost the stored session (e.g. its state store was
-                # reset): start fresh; long-term MEMORY.md survives in the
-                # profile, the transcript does not.
-                logger.info("Opening a fresh Hermes session for app session %s", session_id)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "acp_session_fallback",
+                    channel="acp",
+                    outcome="success",
+                    reason_code="fresh_session_opened",
+                    session_id=session_id,
+                )
                 entry = await self._start(session_id, None)
             self._processes[session_id] = entry
             return entry
         finally:
             self._starting -= 1
-
     async def start_session(self, session_id: str) -> str:
         async with self._session(session_id):
             return (await self._open(session_id, None)).session_id
@@ -293,6 +391,8 @@ class HermesClientManager:
         text: str,
         content_blocks: dict[str, str] | None = None,
     ) -> tuple[str, str]:
+        started_at = monotonic()
+        has_image = content_blocks is not None
         async with self._session(session_id):
             entry = await self._open(session_id, hermes_session_id)
             entry.callbacks.messages.clear()
@@ -315,23 +415,72 @@ class HermesClientManager:
                 raise
             except Exception as exc:
                 await self._close_unlocked(session_id)
+                reason_code = "prompt_timeout" if isinstance(exc, TimeoutError) else "prompt_failed"
                 detail = (
                     "Hermes ACP prompt timed out"
                     if isinstance(exc, TimeoutError) else "Hermes ACP prompt failed"
+                )
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "acp_prompt",
+                    channel="acp",
+                    outcome="error",
+                    reason_code=reason_code,
+                    session_id=session_id,
+                    hermes_session_id=entry.session_id,
+                    has_text=bool(text),
+                    has_image=has_image,
+                    text_length=len(text),
+                    duration_ms=int((monotonic() - started_at) * 1000),
                 )
                 raise HermesUnavailableError(detail) from exc
             finally:
                 entry.last_used = monotonic()
             if response.stop_reason == "cancelled":
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "acp_prompt",
+                    channel="acp",
+                    outcome="rejected",
+                    reason_code="prompt_cancelled",
+                    session_id=session_id,
+                    hermes_session_id=entry.session_id,
+                    stop_reason=response.stop_reason,
+                    duration_ms=int((monotonic() - started_at) * 1000),
+                )
                 raise HermesUnavailableError("Hermes ACP prompt was cancelled")
             if response.stop_reason not in ("end_turn", "max_tokens"):
-                logger.warning("Hermes ACP prompt stop_reason=%s", response.stop_reason)
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "acp_prompt_stop",
+                    channel="acp",
+                    outcome="rejected",
+                    reason_code="unexpected_stop_reason",
+                    session_id=session_id,
+                    hermes_session_id=entry.session_id,
+                    stop_reason=response.stop_reason,
+                )
             answer = "".join(entry.callbacks.messages).strip()
             if answer:
                 entry.history.append({"role": "user", "content": text})
                 entry.history.append({"role": "assistant", "content": answer})
-            # An empty turn can still have invoked tools. Let the caller show
-            # the failure instead of automatically repeating the action.
+            log_event(
+                logger,
+                logging.INFO,
+                "acp_prompt",
+                channel="acp",
+                outcome="success",
+                session_id=session_id,
+                hermes_session_id=entry.session_id,
+                has_text=bool(text),
+                has_image=has_image,
+                text_length=len(text),
+                stop_reason=response.stop_reason,
+                duration_ms=int((monotonic() - started_at) * 1000),
+            )
             return answer, entry.session_id
 
     async def history(self, session_id: str, hermes_session_id: str | None) -> list[dict[str, str]]:
